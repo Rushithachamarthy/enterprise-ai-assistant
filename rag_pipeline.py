@@ -1,13 +1,13 @@
 # rag_pipeline.py
 # The main brain - handles all answers including images!
 
-import streamlit as st  # NEW: For secrets in cloud
+import streamlit as st
 import re
 import time
 from vector_store import create_vector_store, retrieve_chunks
 from huggingface_hub import InferenceClient
 
-# NEW: Get the API key from Streamlit secrets (safe for cloud)
+# Get the API key from Streamlit secrets
 HF_API_KEY = st.secrets["HF_API_KEY"]
 
 if not HF_API_KEY:
@@ -32,7 +32,6 @@ def build_rag_index(document_data):
         METADATA = {}
     VECTOR_INDEX, VECTOR_CHUNKS = create_vector_store(FULL_TEXT)
 
-
 def get_answer(query):
     global VECTOR_INDEX, VECTOR_CHUNKS, FULL_TEXT, METADATA
     
@@ -41,79 +40,100 @@ def get_answer(query):
 
     query_lower = query.lower().strip()
 
-    # === Page Count (PDF + DOCX) ===
+    # === Smart Attendance Counting (Works on Images & Tables) ===
+    count_keywords = ["count", "number", "how many", "total"]
+    status_keywords = ["present", "p ", "holiday", "leave", "absent", "l ", "h "]
+    
+    if any(word in query_lower for word in count_keywords) and any(word in query_lower for word in status_keywords):
+        # Extract all lines and try to find table-like structure
+        lines = [line.strip() for line in FULL_TEXT.splitlines() if line.strip()]
+        
+        # Possible headers for status column
+        possible_headers = ["status", "attendance", "remark", "sts", "att", "day", "present"]
+        header_row = None
+        status_col_index = -1
+        
+        for i, line in enumerate(lines[:10]):  # Check first 10 lines for header
+            lower_line = line.lower()
+            for header in possible_headers:
+                if header in lower_line:
+                    header_row = i
+                    cells = re.split(r'\s{2,}|\t', line)  # Split by multiple spaces or tab
+                    for j, cell in enumerate(cells):
+                        if header in cell.lower():
+                            status_col_index = j
+                            break
+                    if status_col_index != -1:
+                        break
+            if status_col_index != -1:
+                break
+        
+        # Normalize status values
+        status_map = {
+            "p": "Present", "present": "Present", "pres": "Present",
+            "a": "Absent", "absent": "Absent",
+            "h": "Holiday", "holiday": "Holiday",
+            "l": "Leave", "leave": "Leave", "leaves": "Leave"
+        }
+        
+        counts = {"Present": 0, "Absent": 0, "Holiday": 0, "Leave": 0}
+        
+        start_row = header_row + 1 if header_row is not None else 0
+        for line in lines[start_row:]:
+            cells = re.split(r'\s{2,}|\t', line)
+            if status_col_index < len(cells):
+                status = cells[status_col_index].strip().lower()
+                normalized = status_map.get(status, None)
+                if normalized:
+                    counts[normalized] += 1
+                elif status in ["p", "present", "h", "holiday", "l", "leave", "a", "absent"]:
+                    short_map = {"p": "Present", "a": "Absent", "h": "Holiday", "l": "Leave"}
+                    counts[short_map[status]] += 1
+        
+        # Build response for requested statuses
+        requested = [word for word in status_keywords if word.rstrip(" ") in query_lower]
+        display_map = {"present": "Present", "p ": "Present", "holiday": "Holiday", "leave": "Leave", "absent": "Absent"}
+        requested_names = [display_map.get(k, k.capitalize().rstrip()) for k in requested]
+        
+        parts = []
+        for name in requested_names:
+            if counts.get(name, 0) > 0:
+                parts.append(f"**{name}**: {counts[name]}")
+        
+        if parts:
+            return "**Attendance Count:**\n" + "\n".join(parts) + "\n\nPlease let me know if you need more details."
+        else:
+            # Fallback: Let AI count directly from full text
+            pass  # We'll use general RAG below
+
+    # === Other Metadata Queries (Page count, etc.) ===
     if "page" in query_lower and any(w in query_lower for w in ["how many", "number", "count", "pages"]):
         if "page_count" in METADATA:
             return f"**The document has {METADATA['page_count']} pages.**"
 
-    # === Row Count (CSV/XLSX) ===
     if "row" in query_lower and any(w in query_lower for w in ["how many", "number", "count", "rows"]):
         if "row_count" in METADATA:
-            return f"**The spreadsheet has {METADATA['row_count']} data rows (excluding header).**"
+            return f"**The spreadsheet has {METADATA['row_count']} data rows.**"
 
-    # === Column Count (CSV/XLSX) ===
     if "column" in query_lower and any(w in query_lower for w in ["how many", "number", "count", "columns"]):
         if "column_count" in METADATA:
             return f"**The spreadsheet has {METADATA['column_count']} columns.**"
 
-    # === Slide Count (PPTX) ===
     if "slide" in query_lower and any(w in query_lower for w in ["how many", "number", "count", "slides"]):
         if "slide_count" in METADATA:
             return f"**The presentation has {METADATA['slide_count']} slides.**"
 
-    # === Word and Letter Counts ===
-    has_count_keywords = any(w in query_lower for w in ["count", "number", "how many", "total", "together"])
-    if "word" in query_lower or "letter" in query_lower:
-        words = len(re.findall(r'\b\w+\b', FULL_TEXT))
-        letters = len(re.findall(r'[a-zA-Z]', FULL_TEXT))
-        if "word" in query_lower and "letter" in query_lower:
-            return f"**Document Statistics:**\n- Words: {words}\n- Letters (alphabetic characters): {letters}"
-        elif "word" in query_lower and has_count_keywords:
-            return f"**Total words in the document: {words}**"
-        elif "letter" in query_lower and has_count_keywords:
-            return f"**Total letters (alphabetic characters): {letters}**"
-
-    # === Timesheet Status Count ===
-    status_keywords = ["present", "holiday", "leave", "leaves", "absent"]
-    mentioned_statuses = [s for s in status_keywords if s in query_lower]
-    if any(word in query_lower for word in ["count", "number", "how many", "total"]) and mentioned_statuses:
-        try:
-            lines = [line.strip() for line in FULL_TEXT.splitlines() if line.strip()]
-            status_index = None
-            counts = {"Present": 0, "Holiday": 0, "Leave": 0, "Absent": 0}
-            for line in lines:
-                cells = [c.strip() for c in re.split(r'\s{2,}', line) if c.strip()]
-                if not cells:
-                    continue
-                if status_index is None:
-                    try:
-                        status_index = cells.index("Status")
-                    except ValueError:
-                        continue
-                else:
-                    if len(cells) > status_index:
-                        status = cells[status_index]
-                        if status in counts:
-                            counts[status] += 1
-            display_map = {"present": "Present", "holiday": "Holiday", "leaves": "Leave", "leave": "Leave", "absent": "Absent"}
-            requested = set(display_map.get(kw, kw.capitalize()) for kw in mentioned_statuses)
-            parts = [f"{disp}: {cnt}" for disp, cnt in counts.items() if disp in requested and cnt > 0]
-            if parts:
-                return "**Attendance Status Count:**\n" + "\n".join(parts)
-            else:
-                return f"No records found for the requested status(es): {', '.join(requested)}."
-        except Exception as e:
-            return f"Error analyzing status: {str(e)}"
-
-    # === Special Handling for Images (JPG, JPEG, PNG) ===
+    # === Special Handling for Images (Improved Prompt) ===
     if METADATA.get("is_image", False):
-        prompt = f"""You are an expert at analyzing text extracted from images using OCR.
-The text below was extracted from the uploaded image. Use it to answer the question as accurately and precisely as possible.
+        prompt = f"""You are an expert attendance analyzer. Extract and analyze the attendance data from the OCR text below.
 
-Extracted Text from Image:
+Extracted Text:
 {FULL_TEXT}
 
 Question: {query}
+
+Provide a clear, accurate answer based only on the text. If counting attendance (Present, Absent, Holiday, Leave, P, A, H, L), give exact numbers.
+If the question is about counting specific marks, respond directly with the count.
 
 Answer:"""
 
@@ -122,31 +142,26 @@ Answer:"""
                 model=HF_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=512,
-                temperature=0.3
+                temperature=0.2
             )
             answer = response.choices[0].message.content.strip()
-            return answer if answer else "No clear answer could be determined from the extracted text."
+            return answer if answer else "Could not analyze the image content."
         except Exception as e:
-            return f"Error analyzing image: {str(e)}"
+            return f"Error processing image: {str(e)}"
 
-    # === General RAG Query with Retry ===
+    # === General RAG for everything else ===
     if VECTOR_INDEX is None or VECTOR_CHUNKS is None:
         return "Document not indexed yet. Please wait or re-upload."
 
     retrieved_chunks = retrieve_chunks(VECTOR_INDEX, VECTOR_CHUNKS, query, top_k=15)
     if not retrieved_chunks:
-        return "No relevant content found."
+        return "No relevant content found in the document."
 
     context = "\n\n".join(retrieved_chunks)
 
-    prompt = f"""You are a precise and professional enterprise document assistant.
-Answer the question using ONLY the provided context.
-Be concise and directly relevant to the question.
-Do not add external knowledge, opinions, or assumptions.
-Do not hallucinate details not present in the context.
-
-If the answer cannot be clearly and accurately determined from the context, respond exactly with:
-"Answer not found in the document."
+    prompt = f"""You are a precise enterprise document assistant.
+Use ONLY the provided context to answer the question.
+Be direct and professional.
 
 Context:
 {context}
@@ -162,15 +177,14 @@ Answer:"""
                 model=HF_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=1024,
-                temperature=0.1,
-                stop=["</s>"]
+                temperature=0.1
             )
             answer = response.choices[0].message.content.strip()
-            return answer if answer else "No response generated."
+            return answer if answer else "No clear answer found."
         except Exception as e:
             if attempt < max_retries - 1:
                 time.sleep((2 ** attempt) + 1)
             else:
-                return "Temporary API connection issue. Please try again in a moment."
+                return "Temporary issue. Please try again."
 
-    return "Failed to get response after multiple attempts."
+    return "Failed to generate response."
