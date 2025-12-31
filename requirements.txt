@@ -1,0 +1,12 @@
+streamlit
+sentence-transformers
+faiss-cpu
+python-dotenv
+requests
+pypdf
+python-docx
+python-pptx
+pandas
+pillow
+pytesseract
+huggingface_hub>=0.25.0
