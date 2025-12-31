@@ -1,6 +1,6 @@
 # document_loader.py
 # This file reads different types of files and extracts text
-# I made it handle images too with OCR
+# Handles images with OCR (now works on Streamlit Cloud too)
 
 import pandas as pd
 from pypdf import PdfReader
@@ -10,8 +10,9 @@ from PIL import Image
 import pytesseract
 import io
 
-# Path to Tesseract on my Windows machine
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# REMOVED THE WINDOWS-SPECIFIC LINE:
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# → Not needed anymore. Streamlit Cloud installs Tesseract via packages.txt
 
 def load_document(file):
     file_name = file.name.lower()
